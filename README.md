@@ -24,6 +24,7 @@ Then build and flash it:
 
 ```
 cd espi-mbus
+make
 make flash_app
 ```
 
