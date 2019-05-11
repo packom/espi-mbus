@@ -84,22 +84,24 @@ else ifeq ($(SPI_SPEED), 80)
 endif
 
 # Compile options
-CFLAGS = -Os -Iinclude -Iinclude/boards -I$(SDK_BASE)/sdk/include -mlongcalls -c -ggdb -Wpointer-arith -Wundef -Wno-address -Wl,-El -fno-inline-functions -nostdlib -mtext-section-literals -DICACHE_FLASH -Werror -D__ets__ -std=c99 -Ilib/esp8266-software-uart/softuart/include
-ESPIMBUS_CFLAGS = $(CFLAGS)
-SOFTUART_CFLAGS = $(CFLAGS)
+CFLAGS = -Os -Iinclude -mlongcalls -nostdlib -ggdb -Wpointer-arith -Wundef -Wno-address -Wl,-El -fno-inline-functions -mtext-section-literals -DICACHE_FLASH -Werror -D__ets__ 
+ESPIMBUS_CFLAGS = -Ilib/libmbus-esp -Ilib/libmbus-esp/esp -Ilib/libmbus-esp/mbus -Ilib/esp8266-software-uart/softuart/include $(CFLAGS)
+SOFTUART_CFLAGS = -Ilib/esp8266-software-uart/softuart/include $(CFLAGS)
+LIBMBUS_CFLAGS =  -Ilib/libmbus-esp -Ilib/libmbus-esp/esp -Ilib/libmbus-esp/mbus -Ilib/esp8266-software-uart/softuart/include  $(CFLAGS)
 
 # Link options
-LD_DIR = ld
-LDLIBS = -Wl,--start-group -lc -lcirom -lgcc -lhal -lphy -lpp -lnet80211 -lwpa -lmain2 -llwip -Wl,--end-group
-BUILD_NUM_FILE = include/otb_build_num.txt
-LDFLAGS = -T$(SDK_BASE)/$(ESP_SDK)/ld/eagle.app.v6.ld -nostdlib -Wl,--no-check-sections -Wl,-static -L$(SDK_BASE)/$(ESP_SDK)/lib -u call_user_start -u Cache_Read_Enable_New -Lbin
-LD_SCRIPT = $(SDK_BASE)/$(ESP_SDK)/ld/eagle.app.v6.ld
+LDLIBS = -nostdlib -Wl,--start-group -lmain -lupgrade -lnet80211 -lwpa -llwip -lpp -lphy -Wl,--end-group -lcirom -lgcc
+LDFLAGS = -Teagle.app.v6.ld
 
 # Source and object directories
 ESPIMBUS_SRC_DIR = src
 ESPIMBUS_OBJ_DIR = obj/espimbus
 SOFTUART_SRC_DIR = lib/esp8266-software-uart/softuart
 SOFTUART_OBJ_DIR = obj/softuart
+LIBMBUS_SRC_DIR = lib/libmbus-esp/mbus
+LIBMBUS_ESP_SRC_DIR = lib/libmbus-esp/esp
+LIBMBUS_OBJ_DIR = obj/libmbus-esp/mbus
+LIBMBUS_ESP_OBJ_DIR = obj/libmbus-esp/esp
 
 # Object files
 espimbusObjects = $(ESPIMBUS_OBJ_DIR)/main.o
@@ -108,6 +110,13 @@ espimbusDep = $(espimbusObjects:%.o=%.d)
 softuartObjects = $(SOFTUART_OBJ_DIR)/softuart.o 
 softuartDep = $(softuartObjects:%.o=%.d)
 
+libmbusObjects = $(LIBMBUS_OBJ_DIR)/mbus.o \
+                 $(LIBMBUS_OBJ_DIR)/mbus-protocol.o \
+                 $(LIBMBUS_OBJ_DIR)/mbus-protocol-aux.o \
+                 $(LIBMBUS_OBJ_DIR)/mbus-serial.o \
+                 $(LIBMBUS_ESP_OBJ_DIR)/mbus-esp.o
+libmbusDep = $(libmbusObjects:%.o=%.d)
+
 all: directories app_image
 
 app_image: bin/app_image.elf
@@ -115,40 +124,51 @@ app_image: bin/app_image.elf
 	$(OBJDUMP) -d bin/app_image.elf > bin/app_image.dis
 	$(ESPTOOL_PY) elf2image $^
 
-bin/app_image.elf: libmain2 espimbus_objects softuart_objects
-	$(LD) $(LDFLAGS) -o bin/app_image.elf $(espimbusObjects) $(softuartObjects) $(LDLIBS)
+bin/app_image.elf: espimbus_objects softuart_objects libmbus_objects
+	$(LD) $(LDFLAGS) -o bin/app_image.elf $(espimbusObjects) $(softuartObjects) $(libmbusObjects) $(LDLIBS)
 
--include $(espimbusDep) $(softuartDep)
+-include $(espimbusDep) $(softuartDep) $(libmbusDep)
 
 sdk_init_data.bin: directories
 	rm -f bin/sdk_init_data.bin
 	if test -f $(SDK_BASE)/$(ESP_SDK)/bin/esp_init_data_default_v05.bin; then ln -s $(SDK_BASE)/$(ESP_SDK)/bin/esp_init_data_default_v05.bin bin/sdk_init_data.bin; else ln -s $(SDK_BASE)/$(ESP_SDK)/bin/esp_init_data_default.bin bin/sdk_init_data.bin; fi
 
-# can replace with our own version (from rboot-bigflash.c)
-libmain2: directories
-	$(OBJCOPY) -W Cache_Read_Enable_New $(SDK_BASE)/$(ESP_SDK)/lib/libmain.a bin/libmain2.a
-
 espimbus_objects: $(espimbusObjects)
 
 softuart_objects: $(softuartObjects)
+
+libmbus_objects: $(libmbusObjects)
 
 $(ESPIMBUS_OBJ_DIR)/%.o: $(ESPIMBUS_SRC_DIR)/%.c
 	$(CC) $(ESPIMBUS_CFLAGS) -MMD -c $< -o $@ 
 
 $(SOFTUART_OBJ_DIR)/%.o: $(SOFTUART_SRC_DIR)/%.c
-	$(CC) $(CFLAGS) $(SOFTUART_CFLAGS) -MMD -c $< -o $@ 
+	$(CC) $(SOFTUART_CFLAGS) -MMD -c $< -o $@ 
+
+$(LIBMBUS_OBJ_DIR)/%.o: $(LIBMBUS_SRC_DIR)/%.c
+	$(CC) $(LIBMBUS_CFLAGS) -MMD -c $< -o $@ 
+
+$(LIBMBUS_ESP_OBJ_DIR)/%.o: $(LIBMBUS_ESP_SRC_DIR)/%.c
+	$(CC) $(LIBMBUS_CFLAGS) -MMD -c $< -o $@ 
 
 flash_app: app_image
+	./standby.sh
 	$(ESPTOOL_PY) $(ESPTOOL_PY_OPTS) write_flash 0x0 bin/app_image.elf-0x00000.bin 0x10000 bin/app_image.elf-0x10000.bin
+	./run.sh
 
 flash: flash_app
 
 flash_blank: 
+	./standby.sh
 	$(ESPTOOL_PY) $(ESPTOOL_PY_OPTS) write_flash 0x3fb000 $(SDK_BASE)/$(ESP_SDK)/bin/blank.bin
+	./standby.sh
 	$(ESPTOOL_PY) $(ESPTOOL_PY_OPTS) write_flash 0x3fe000 $(SDK_BASE)/$(ESP_SDK)/bin/blank.bin
+	./run.sh
 
 flash_sdk: sdk_init_data.bin
+	./standby.sh
 	$(ESPTOOL_PY) $(ESPTOOL_PY_OPTS) write_flash 0x3fc000 bin/sdk_init_data.bin
+	./run.sh
 
 flash_initial: flash_all
 
@@ -175,7 +195,7 @@ flash_40mhz:
 	$(ESPTOOL_PY) $(ESPTOOL_PY_OPTS) write_flash 0x3fc000 flash/esp_init_data_40mhz_xtal.hex
 
 directories:
-	mkdir -p bin $(ESPIMBUS_OBJ_DIR) $(SOFTUART_OBJ_DIR)
+	mkdir -p bin $(ESPIMBUS_OBJ_DIR) $(SOFTUART_OBJ_DIR) $ $(LIBMBUS_OBJ_DIR) $(LIBMBUS_ESP_OBJ_DIR)
 
 docs: FORCE
 	-$(MAKE) -C docs html

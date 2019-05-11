@@ -25,58 +25,16 @@
 #include "esp_sdk_ver.h"
 #include "user_config.h"
 #include "softuart.h"
+#include "mbus.h"
 
-#define user_procTaskPrio        0
-#define user_procTaskQueueLen    1
-os_event_t    user_procTaskQueue[user_procTaskQueueLen];
-static void user_procTask(os_event_t *events);
+// Globals
+static os_timer_t mbus_response_timer;
+mbus_handle *handle = NULL;
 
-static os_timer_t some_timer;
-
-Softuart uart;
-#define REQ_DATA_LEN  5
-unsigned char req_data[REQ_DATA_LEN] = {0x10, 0x5b, 0x30, 0x8b, 0x16};
-extern int ets_printf(const char *fmt, ...);
-
-void some_timerfunc(void *arg)
-{
-  int ii;
-  unsigned char rcv_data;
-
-  ets_printf("some_timerfunc\n");
-
-  os_printf("Initialize UART\n");
-  Softuart_SetPinTx(&uart, 4);
-  Softuart_SetPinRx(&uart, 5);
-  Softuart_Init(&uart, 2400);
-
-  os_printf("Send MBus request data: ");
-  for (ii = 0; ii < REQ_DATA_LEN; ii++)
-  {
-    os_printf("%2.2x", req_data[ii]);
-    Softuart_Putchar(&uart, req_data[ii]);
-  }
-  os_printf("\n");
-
-  // Give time for response
-  os_delay_us(100000);
-
-  os_printf("Received MBus data: ");
-  while (Softuart_Available(&uart))
-  {
-    rcv_data = Softuart_Read(&uart);
-    os_printf("%2.2x ", rcv_data);
-  }
-  os_printf("\n");
-
-  os_printf("Done\n");
-}
-
-static void ICACHE_FLASH_ATTR
-user_procTask(os_event_t *events)
-{
-  os_delay_us(10);
-}
+// Function protoypes
+static int init_mbus_slaves(mbus_handle *handle);
+void handle_mbus_response(void *arg);
+void send_mbus_query(void);
 
 void ICACHE_FLASH_ATTR user_init(void)
 {
@@ -85,20 +43,10 @@ void ICACHE_FLASH_ATTR user_init(void)
   // 432s (0x689D0 in ms)
   system_timer_reinit();
 
-  // Disarm timer
-  os_timer_disarm(&some_timer);
+  uart_div_modify(0, UART_CLK_FREQ / 74880);
+  uart_div_modify(1, UART_CLK_FREQ / 74880);
 
-  // Setup timer
-  os_timer_setfn(&some_timer, (os_timer_func_t *)some_timerfunc, NULL);
-
-  // Arm the timer
-  // &some_timer is the pointer
-  // 1000 is the fire time in ms
-  // 0 for once and 1 for repeating
-  os_timer_arm(&some_timer, 1000, 0);
-    
-  // Start os task
-  system_os_task(user_procTask, user_procTaskPrio, user_procTaskQueue, user_procTaskQueueLen);
+  system_init_done_cb((init_done_cb_t)send_mbus_query);
 }
 
 #if ESP_SDK_VERSION >= 030000
@@ -131,3 +79,118 @@ void ICACHE_FLASH_ATTR user_pre_init(void)
   return;
 }
 #endif // ESP_SDK_VERSION >= 030000
+
+void
+ICACHE_FLASH_ATTR
+send_mbus_query(void)
+{
+  char *device = "/dev/espi";
+  int address = 48;
+  long baudrate = 2400;
+
+  os_printf("MBUS: Initialize M-Bus library\n");
+  if ((handle = mbus_context_serial(device)) == NULL)
+  {
+    os_printf("MBUS: Could not initialize M-Bus library: %s\n",  mbus_error_str());
+    return;
+  }
+
+  os_printf("MBUS: Set up serial port\n");
+  if (mbus_connect(handle) == -1)
+  {
+    os_printf("MBUS: Failed to setup serial port\n");
+    mbus_context_free(handle);
+    return;
+  }
+
+  os_printf("MBUS: Set baudrate\n");
+  if (mbus_serial_set_baudrate(handle, baudrate) == -1)
+  {
+    os_printf("MBUS: Failed to set baud rate\n");
+    mbus_disconnect(handle);
+    mbus_context_free(handle);
+    return;
+  }
+
+  os_printf("MBUS: Init slaves\n");
+  if (init_mbus_slaves(handle) == 0)
+  {
+    os_printf("MBUS: Failed to init slaves\n");
+    mbus_disconnect(handle);
+    mbus_context_free(handle);
+    return;
+  }
+
+  os_printf("MBUS: Send request\n");
+  if (mbus_send_request_frame(handle, address) == -1)
+  {
+    os_printf("MBUS: Failed to send M-Bus request\n");
+    mbus_disconnect(handle);
+    mbus_context_free(handle);
+    return;
+  }
+
+  // Handle the response - need to leave it at least 400-500ms
+  os_timer_disarm(&mbus_response_timer);
+  os_timer_setfn(&mbus_response_timer, (os_timer_func_t *)handle_mbus_response, NULL);
+  os_timer_arm(&mbus_response_timer, 1000, 0);
+
+  os_printf("MBUS: Sent request\n");
+
+  return;
+}
+
+void
+ICACHE_FLASH_ATTR
+handle_mbus_response(void *arg)
+{
+  mbus_frame reply;
+  mbus_frame_data reply_data;
+  char *xml_result;
+
+  os_printf("MBUS: Receive response\n");
+  if (mbus_recv_frame(handle, &reply) != MBUS_RECV_RESULT_OK)
+  {
+    os_printf("MBUS: Failed to receive M-Bus response\n");
+    return;
+  }
+
+  os_printf("MBUS: Parse frame\n");
+  if (mbus_frame_data_parse(&reply, &reply_data) == -1)
+  {
+    os_printf("MBUS: M-bus data parse error: %s\n", mbus_error_str());
+    mbus_disconnect(handle);
+    mbus_context_free(handle);
+    return;
+  }
+
+  os_printf("MBUS: Generate XML\n");
+  if ((xml_result = mbus_frame_data_xml(&reply_data)) == NULL)
+  {
+    os_printf("MBUS: Failed to generate XML: %s\n", mbus_error_str());
+    mbus_disconnect(handle);
+    mbus_context_free(handle);
+    return;
+  }
+
+  os_printf("%s\n", xml_result);
+
+  return;
+}
+
+static int
+ICACHE_FLASH_ATTR
+init_mbus_slaves(mbus_handle *handle)
+{
+    if (mbus_send_ping_frame(handle, MBUS_ADDRESS_NETWORK_LAYER, 1) == -1)
+    {
+        return 0;
+    }
+
+    if (mbus_send_ping_frame(handle, MBUS_ADDRESS_NETWORK_LAYER, 1) == -1)
+    {
+        return 0;
+    }
+
+    return 1;
+}
